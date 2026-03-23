@@ -1,13 +1,15 @@
 /**
  * @file    pulser_main.c
  * @brief   Sliding-Precision Pulse Generator — Complete Firmware
- *          MCU  : STM32F407VGT6
+ *          MCU  : STM32F429ZIT6  (LQFP144, Cortex-M4, 180 MHz)
  *          LCD  : LCD-OlinuXino-7TS (800x480, RGB565, LTDC parallel RGB)
  *          Touch: XPT2046 (SPI touch controller on OlinuXino-7TS)
  *          DAC  : AD5791 18-bit SPI DAC (amplitude)
  *          Timer: TIM2 (pulse rep-rate), TIM3 (pulse width), TIM4 (ramp tick)
- *          UART : USART2 (RS-232, PA2/PA3), USB CDC via USART6 or USB OTG
+ *          UART : USART2 (RS-232, PA2/PA3)
  *          NVRAM: Backup SRAM (4KB, VBAT-retained, 10 config slots)
+ *          SDRAM: External 16-bit SDRAM via FMC Bank 1 (0xC0000000,
+ *                 frame buffer).  Sized for IS42S16400J or equivalent.
  *
  * ── Architecture ────────────────────────────────────────────────────────────
  *  The firmware runs a cooperative state machine in the main loop:
@@ -36,17 +38,18 @@
  *    // After HAL_Init(), SystemClock_Config(), MX_GPIO_Init(), etc.:
  *    pulser_run();   // never returns
  *
- * ── Pin map (adjust to your board) ─────────────────────────────────────────
- *  LTDC RGB    : see ltdc_gpio_init()
- *  Touch CS    : PA4    Touch CLK: PA5  Touch MISO: PA6  Touch MOSI: PA7
- *  Touch IRQ   : PB0
+ * ── Pin map (STM32F429ZIT6) ─────────────────────────────────────────────────
+ *  LTDC RGB    : see ltdc_init() — note PB0/PB1/PG10/PG12 use AF9, rest AF14
+ *  Touch CS    : PA8    Touch CLK: PB13  Touch MISO: PB14  Touch MOSI: PB15
+ *  Touch IRQ   : PB5    (SPI2 shared bus)
  *  AD5791 CS   : PB12   AD5791 CLK: PB13  MISO: PB14  MOSI: PB15 (SPI2)
  *  S/H HOLD    : PC0    (high = sample, low = hold)
- *  PULSE OUT   : already driven by TIM2 CH1 (PA0) via output stage
- *  TRIG OUT    : TIM3 CH1 (PA6, remap if clash)
+ *  PULSE OUT   : TIM2 CH1 (PA0) via output stage
  *  USART2 TX   : PA2    USART2 RX : PA3
- *  Keypad rows : PD0–PD3  cols : PD4–PD7
- *  Spinner A   : PE0   Spinner B : PE1   Spinner SW : PE2
+ *  Keypad rows : PC8, PC9, PC11, PC12   cols: PF6–PF9
+ *  Spinner A   : PB3 (EXTI3)  Spinner B: PB4   Spinner SW: PE2 (EXTI2)
+ *  FMC SDRAM   : Bank1 (0xC0000000) — D0–D15, A0–A11, SDCLK/SDNWE/…
+ *                see sdram_fmc_init() for full GPIO list
  * ──────────────────────────────────────────────────────────────────────────*/
 
 #include "stm32f4xx_hal.h"
@@ -56,6 +59,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <ctype.h>
+
+/* GPIO_AF9_LTDC: On STM32F429 certain LTDC pins (PB0, PB1, PG10, PG12) are
+ * wired to alternate function 9, not 14.  The STM32F4 HAL names AF9 after
+ * TIM14 (also on AF9), but the numeric value 9 is what the AFR register
+ * needs.  We define a clear alias so the LTDC code documents its intent. */
+#ifndef GPIO_AF9_LTDC
+#define GPIO_AF9_LTDC  GPIO_AF9_TIM14
+#endif
 
 /* ============================================================
  *  SECTION 1 — COMPILE-TIME CONFIGURATION
@@ -707,6 +718,122 @@ static void render_screen(void) {
  *  SECTION 7 — HARDWARE PERIPHERALS
  * ============================================================ */
 
+/* ── FMC SDRAM (frame buffer memory at 0xC0000000) ─────────
+ *
+ *  Targets a 16-bit, 4-bank SDRAM with 12-bit row / 8-bit column
+ *  addressing (e.g. IS42S16400J-7 or equivalent 64 Mbit device).
+ *  FMC Bank 1  →  base address 0xC0000000.
+ *
+ *  GPIO assignments (all AF12 = FMC):
+ *   Address  A0–A5   : PF0–PF5      A6–A9  : PF12–PF15
+ *            A10–A11 : PG0–PG1
+ *   Data     D0–D1   : PD14–PD15    D2–D3  : PD0–PD1
+ *            D4–D12  : PE7–PE15     D13–D15: PD8–PD10
+ *   Byte en. NBL0    : PE0          NBL1   : PE1
+ *   Control  SDCLK   : PG8          SDNCAS : PG15
+ *            SDNRAS  : PF11         SDNWE  : PH5
+ *            SDCKE0  : PH2          SDNE0  : PH3
+ *
+ *  NOTE: Adjust timing constants if your SDRAM chip differs.
+ *        Assumes HCLK = 180 MHz → SDCLK = HCLK/2 = 90 MHz.
+ * ─────────────────────────────────────────────────────────── */
+static SDRAM_HandleTypeDef hsdram;
+
+static void sdram_fmc_init(void) {
+    __HAL_RCC_FMC_CLK_ENABLE();
+    __HAL_RCC_GPIOD_CLK_ENABLE(); __HAL_RCC_GPIOE_CLK_ENABLE();
+    __HAL_RCC_GPIOF_CLK_ENABLE(); __HAL_RCC_GPIOG_CLK_ENABLE();
+    __HAL_RCC_GPIOH_CLK_ENABLE();
+
+    GPIO_InitTypeDef g = {0};
+    g.Mode      = GPIO_MODE_AF_PP;
+    g.Pull      = GPIO_NOPULL;
+    g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    g.Alternate = GPIO_AF12_FMC;
+
+    /* GPIOD: D0=PD14, D1=PD15, D2=PD0, D3=PD1, D13=PD8, D14=PD9, D15=PD10 */
+    g.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10
+          | GPIO_PIN_14 | GPIO_PIN_15;
+    HAL_GPIO_Init(GPIOD, &g);
+
+    /* GPIOE: NBL0=PE0, NBL1=PE1, D4–D12=PE7–PE15 */
+    g.Pin = GPIO_PIN_0  | GPIO_PIN_1  | GPIO_PIN_7  | GPIO_PIN_8  | GPIO_PIN_9
+          | GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14
+          | GPIO_PIN_15;
+    HAL_GPIO_Init(GPIOE, &g);
+
+    /* GPIOF: A0–A5=PF0–PF5, SDNRAS=PF11, A6–A9=PF12–PF15 */
+    g.Pin = GPIO_PIN_0  | GPIO_PIN_1  | GPIO_PIN_2  | GPIO_PIN_3  | GPIO_PIN_4
+          | GPIO_PIN_5  | GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14
+          | GPIO_PIN_15;
+    HAL_GPIO_Init(GPIOF, &g);
+
+    /* GPIOG: A10=PG0, A11=PG1, SDCLK=PG8, SDNCAS=PG15 */
+    g.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_8 | GPIO_PIN_15;
+    HAL_GPIO_Init(GPIOG, &g);
+
+    /* GPIOH: SDCKE0=PH2, SDNE0=PH3, SDNWE=PH5
+     *  Using PH5 for SDNWE avoids the PC0 conflict with the S/H switch. */
+    g.Pin = GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_5;
+    HAL_GPIO_Init(GPIOH, &g);
+
+    /* ── FMC SDRAM controller ── */
+    FMC_SDRAM_TimingTypeDef timing = {0};
+
+    hsdram.Instance                = FMC_Bank5_6_R;
+    hsdram.Init.SDBank             = FMC_SDRAM_BANK1;
+    hsdram.Init.ColumnBitsNumber   = FMC_SDRAM_COLUMN_BITS_NUM_8;
+    hsdram.Init.RowBitsNumber      = FMC_SDRAM_ROW_BITS_NUM_12;
+    hsdram.Init.MemoryDataWidth    = FMC_SDRAM_MEM_BUS_WIDTH_16;
+    hsdram.Init.InternalBankNumber = FMC_SDRAM_INTERN_BANKS_NUM_4;
+    hsdram.Init.CASLatency         = FMC_SDRAM_CAS_LATENCY_3;
+    hsdram.Init.WriteProtection    = FMC_SDRAM_WRITE_PROTECTION_DISABLE;
+    hsdram.Init.SDClockPeriod      = FMC_SDRAM_CLOCK_PERIOD_2; /* 90 MHz */
+    hsdram.Init.ReadBurst          = FMC_SDRAM_RBURST_ENABLE;
+    hsdram.Init.ReadPipeDelay      = FMC_SDRAM_RPIPE_DELAY_0;
+
+    /* Timing for IS42S16400J-7 @ 90 MHz SDCLK (11.1 ns/cycle) */
+    timing.LoadToActiveDelay    = 2;  /* TMRD  ≥ 2 clk           */
+    timing.ExitSelfRefreshDelay = 7;  /* TXSR  ≥ 70 ns → 7 clk   */
+    timing.SelfRefreshTime      = 4;  /* TRAS  ≥ 42 ns → 4 clk   */
+    timing.RowCycleDelay        = 7;  /* TRC   ≥ 63 ns → 7 clk   */
+    timing.WriteRecoveryTime    = 2;  /* TWR   ≥ 1clk+7ns → 2 clk*/
+    timing.RPDelay              = 2;  /* TRP   ≥ 18 ns → 2 clk   */
+    timing.RCDDelay             = 2;  /* TRCD  ≥ 18 ns → 2 clk   */
+
+    HAL_SDRAM_Init(&hsdram, &timing);
+
+    /* ── SDRAM initialisation sequence ── */
+    FMC_SDRAM_CommandTypeDef cmd = {0};
+    cmd.CommandTarget = FMC_SDRAM_CMD_TARGET_BANK1;
+
+    /* 1. Enable clock */
+    cmd.CommandMode            = FMC_SDRAM_CMD_CLK_ENABLE;
+    cmd.AutoRefreshNumber      = 1;
+    cmd.ModeRegisterDefinition = 0;
+    HAL_SDRAM_SendCommand(&hsdram, &cmd, 0xFFFF);
+    HAL_Delay(1); /* wait ≥ 100 µs */
+
+    /* 2. Precharge all banks */
+    cmd.CommandMode = FMC_SDRAM_CMD_PALL;
+    HAL_SDRAM_SendCommand(&hsdram, &cmd, 0xFFFF);
+
+    /* 3. Eight auto-refresh cycles */
+    cmd.CommandMode       = FMC_SDRAM_CMD_AUTOREFRESH_MODE;
+    cmd.AutoRefreshNumber = 8;
+    HAL_SDRAM_SendCommand(&hsdram, &cmd, 0xFFFF);
+
+    /* 4. Load mode register: CAS=3, burst=1, sequential, single-write */
+    cmd.CommandMode            = FMC_SDRAM_CMD_LOAD_MODE;
+    cmd.AutoRefreshNumber      = 1;
+    cmd.ModeRegisterDefinition = 0x0230; /* CAS=3, BL=1, write-burst=single */
+    HAL_SDRAM_SendCommand(&hsdram, &cmd, 0xFFFF);
+
+    /* 5. Refresh rate: 64 ms / 4096 rows = 15.625 µs/row
+     *    At 90 MHz: 15.625e-6 × 90e6 ≈ 1406 cycles → subtract 20 for margin */
+    HAL_SDRAM_ProgramRefreshRate(&hsdram, 1386);
+}
+
 /* ── LTDC ─────────────────────────────────────────────────── */
 static LTDC_HandleTypeDef hltdc;
 
@@ -720,24 +847,33 @@ static void ltdc_init(void) {
     GPIO_InitTypeDef gpio = {0};
     gpio.Mode = GPIO_MODE_AF_PP; gpio.Pull = GPIO_NOPULL;
     gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH; gpio.Alternate = GPIO_AF14_LTDC;
-    /* Red   R2=PC10 R3=PB0  R4=PA11 R5=PA12 R6=PB1  R7=PG6  */
+    /* Red   R2=PC10  R4=PA11  R5=PA12  R7=PG6  (all AF14)             */
     gpio.Pin=GPIO_PIN_10; HAL_GPIO_Init(GPIOC,&gpio);
-    gpio.Pin=GPIO_PIN_0;  HAL_GPIO_Init(GPIOB,&gpio);
     gpio.Pin=GPIO_PIN_11|GPIO_PIN_12; HAL_GPIO_Init(GPIOA,&gpio);
-    gpio.Pin=GPIO_PIN_1;  HAL_GPIO_Init(GPIOB,&gpio);
     gpio.Pin=GPIO_PIN_6;  HAL_GPIO_Init(GPIOG,&gpio);
-    /* Green G2=PA6  G3=PG10 G4=PB10 G5=PB11 G6=PC7  G7=PD3  */
+    /* Red   R3=PB0  R6=PB1  — AF9 on STM32F429 (not AF14)             */
+    gpio.Alternate=GPIO_AF9_LTDC; /* AF9 on STM32F429 */
+    gpio.Pin=GPIO_PIN_0;  HAL_GPIO_Init(GPIOB,&gpio);  /* R3 */
+    gpio.Pin=GPIO_PIN_1;  HAL_GPIO_Init(GPIOB,&gpio);  /* R6 */
+    gpio.Alternate=GPIO_AF14_LTDC;
+    /* Green G2=PA6  G4=PB10  G5=PB11  G6=PC7  G7=PD3  (all AF14)     */
     gpio.Pin=GPIO_PIN_6;  HAL_GPIO_Init(GPIOA,&gpio);
-    gpio.Pin=GPIO_PIN_10; HAL_GPIO_Init(GPIOG,&gpio);
     gpio.Pin=GPIO_PIN_10|GPIO_PIN_11; HAL_GPIO_Init(GPIOB,&gpio);
     gpio.Pin=GPIO_PIN_7;  HAL_GPIO_Init(GPIOC,&gpio);
     gpio.Pin=GPIO_PIN_3;  HAL_GPIO_Init(GPIOD,&gpio);
-    /* Blue  B2=PD6  B3=PG11 B4=PG12 B5=PA3  B6=PB8  B7=PB9  */
+    /* Green G3=PG10 — AF9 on STM32F429                                 */
+    gpio.Alternate=GPIO_AF9_LTDC; /* AF9 on STM32F429 */
+    gpio.Pin=GPIO_PIN_10; HAL_GPIO_Init(GPIOG,&gpio);  /* G3 */
+    gpio.Alternate=GPIO_AF14_LTDC;
+    /* Blue  B2=PD6  B3=PG11  B5=PA3  B6=PB8  B7=PB9  (all AF14)      */
     gpio.Pin=GPIO_PIN_6;  HAL_GPIO_Init(GPIOD,&gpio);
     gpio.Pin=GPIO_PIN_11; HAL_GPIO_Init(GPIOG,&gpio);
-    gpio.Pin=GPIO_PIN_12; HAL_GPIO_Init(GPIOG,&gpio);
     gpio.Pin=GPIO_PIN_3;  HAL_GPIO_Init(GPIOA,&gpio);
     gpio.Pin=GPIO_PIN_8|GPIO_PIN_9; HAL_GPIO_Init(GPIOB,&gpio);
+    /* Blue  B4=PG12 — AF9 on STM32F429                                 */
+    gpio.Alternate=GPIO_AF9_LTDC; /* AF9 on STM32F429 */
+    gpio.Pin=GPIO_PIN_12; HAL_GPIO_Init(GPIOG,&gpio);  /* B4 */
+    gpio.Alternate=GPIO_AF14_LTDC;
     /* Control CLK=PG7 HSYNC=PC6 VSYNC=PA4 DE=PF10 */
     gpio.Pin=GPIO_PIN_7;  HAL_GPIO_Init(GPIOG,&gpio);
     gpio.Pin=GPIO_PIN_6;  HAL_GPIO_Init(GPIOC,&gpio);
@@ -759,7 +895,7 @@ static void ltdc_init(void) {
     hltdc.Init.HorizontalSync = 47; hltdc.Init.VerticalSync = 2;
     hltdc.Init.AccumulatedHBP = 215; hltdc.Init.AccumulatedVBP = 65;
     hltdc.Init.AccumulatedActiveW = 1015; hltdc.Init.AccumulatedActiveH = 545;
-    hltdc.Init.TotalWidth = 1055; hltdc.Init.TotalHeigh = 524;
+    hltdc.Init.TotalWidth = 1055; hltdc.Init.TotalHeigh = 567; /* VFP=22 lines; 'TotalHeigh' is ST HAL's field name */
     memset(&hltdc.Init.Backcolor, 0, sizeof(hltdc.Init.Backcolor));
     HAL_LTDC_Init(&hltdc);
 
@@ -778,10 +914,12 @@ static void ltdc_init(void) {
 static SPI_HandleTypeDef hspi2;
 #define DAC_CS_PORT  GPIOB
 #define DAC_CS_PIN   GPIO_PIN_12
+/* TCH_CS moved from PA4 to PA8: PA4 = LTDC_VSYNC (AF14) on STM32F429 */
 #define TCH_CS_PORT  GPIOA
-#define TCH_CS_PIN   GPIO_PIN_4
+#define TCH_CS_PIN   GPIO_PIN_8
+/* TCH_IRQ moved from PB0 to PB5: PB0 = LTDC_R3 (AF9) on STM32F429 */
 #define TCH_IRQ_PORT GPIOB
-#define TCH_IRQ_PIN  GPIO_PIN_0
+#define TCH_IRQ_PIN  GPIO_PIN_5
 #define SH_PORT      GPIOC
 #define SH_PIN       GPIO_PIN_0
 
@@ -911,8 +1049,10 @@ static void uart_puts(const char *s) {
 }
 
 /* ── Keypad (4×4 matrix) ─────────────────────────────────── */
-/* Rows: PD0–PD3 (output, pull hi; drive low to scan)
-   Cols: PD4–PD7 (input, pull-up)                              */
+/* Rows: PC8, PC9, PC11, PC12 (output, drive low to scan)
+   Cols: PF6–PF9  (input, pull-up)
+   Rationale: original PD0–PD3 conflict with FMC_D2/D3 and LTDC_G7;
+              original PD4–PD7 conflict with LTDC_B2 (PD6).          */
 static const uint8_t KP_MAP[KP_ROWS][KP_COLS] = {
     {'1','2','3','A'},
     {'4','5','6','B'},
@@ -921,32 +1061,45 @@ static const uint8_t KP_MAP[KP_ROWS][KP_COLS] = {
 };
 /* 'A'=UP 'B'=DOWN 'C'=ENTER 'D'=BACK  */
 
+/* Per-row pin masks on GPIOC */
+static const uint16_t KP_ROW_PINS[KP_ROWS] = {
+    GPIO_PIN_8, GPIO_PIN_9, GPIO_PIN_11, GPIO_PIN_12
+};
+/* Combined mask of all keypad row pins — used to set all rows HIGH at once */
+#define KP_ROW_ALL_PINS (GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_11 | GPIO_PIN_12)
+/* Per-col pin masks on GPIOF */
+static const uint16_t KP_COL_PINS[KP_COLS] = {
+    GPIO_PIN_6, GPIO_PIN_7, GPIO_PIN_8, GPIO_PIN_9
+};
+
 static void keypad_init(void) {
-    __HAL_RCC_GPIOD_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOF_CLK_ENABLE();
     GPIO_InitTypeDef g = {0};
-    /* Rows as outputs */
-    g.Pin=GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3;
-    g.Mode=GPIO_MODE_OUTPUT_PP; g.Speed=GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOD,&g);
-    /* Cols as input pull-up */
-    g.Pin=GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7;
-    g.Mode=GPIO_MODE_INPUT; g.Pull=GPIO_PULLUP;
-    HAL_GPIO_Init(GPIOD,&g);
-    /* All rows high */
-    GPIOD->ODR |= 0x0Fu;
+    /* Rows as push-pull outputs, initially high */
+    g.Pin  = KP_ROW_ALL_PINS;
+    g.Mode = GPIO_MODE_OUTPUT_PP; g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &g);
+    HAL_GPIO_WritePin(GPIOC, KP_ROW_ALL_PINS, GPIO_PIN_SET);
+    /* Cols as pull-up inputs */
+    g.Pin  = GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9;
+    g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOF, &g);
 }
 
 static char keypad_scan(void) {
     for (int r = 0; r < KP_ROWS; r++) {
-        /* Drive row r low */
-        GPIOD->ODR = (GPIOD->ODR | 0x0Fu) & ~(1u << r);
+        /* Drive all rows high then pull row r low */
+        HAL_GPIO_WritePin(GPIOC, KP_ROW_ALL_PINS, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOC, KP_ROW_PINS[r], GPIO_PIN_RESET);
         HAL_Delay(1);
-        uint16_t cols = (GPIOD->IDR >> 4u) & 0x0Fu;
-        GPIOD->ODR |= 0x0Fu; /* restore */
         for (int c = 0; c < KP_COLS; c++) {
-            if (!(cols & (1u << c))) return KP_MAP[r][c];
+            if (!HAL_GPIO_ReadPin(GPIOF, KP_COL_PINS[c]))
+                return KP_MAP[r][c];
         }
     }
+    /* Restore all rows high */
+    HAL_GPIO_WritePin(GPIOC, KP_ROW_ALL_PINS, GPIO_PIN_SET);
     return 0;
 }
 
@@ -962,34 +1115,37 @@ static char keypad_get_key(void) {
     return 0;
 }
 
-/* ── Spinner encoder (PE0=A, PE1=B, PE2=SW) ─────────────── */
+/* ── Spinner encoder (PB3=A, PB4=B, PE2=SW) ─────────────── */
+/* PB3/PB4 replace PE0/PE1 which are FMC_NBL0/NBL1 on STM32F429. */
 static volatile int8_t  spinner_delta = 0;
 static volatile bool    spinner_sw    = false;
 
 static void spinner_init(void) {
+    __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOE_CLK_ENABLE();
     GPIO_InitTypeDef g = {0};
-    g.Pin=GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2;
+    /* PB3=A, PB4=B — plain inputs with pull-up */
+    g.Pin=GPIO_PIN_3|GPIO_PIN_4;
     g.Mode=GPIO_MODE_INPUT; g.Pull=GPIO_PULLUP;
-    HAL_GPIO_Init(GPIOE,&g);
+    HAL_GPIO_Init(GPIOB,&g);
 
-    /* Use EXTI on PE0 for A-phase detection */
-    g.Mode=GPIO_MODE_IT_RISING_FALLING; g.Pin=GPIO_PIN_0;
-    HAL_GPIO_Init(GPIOE,&g);
-    HAL_NVIC_SetPriority(EXTI0_IRQn,2,0);
-    HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+    /* Use EXTI on PB3 (EXTI3) for A-phase detection */
+    g.Mode=GPIO_MODE_IT_RISING_FALLING; g.Pin=GPIO_PIN_3;
+    HAL_GPIO_Init(GPIOB,&g);
+    HAL_NVIC_SetPriority(EXTI3_IRQn,2,0);
+    HAL_NVIC_EnableIRQ(EXTI3_IRQn);
 
-    /* PE2 switch */
-    g.Mode=GPIO_MODE_IT_FALLING; g.Pin=GPIO_PIN_2;
+    /* PE2 switch — EXTI2 unchanged */
+    g.Mode=GPIO_MODE_IT_FALLING; g.Pin=GPIO_PIN_2; g.Pull=GPIO_PULLUP;
     HAL_GPIO_Init(GPIOE,&g);
     HAL_NVIC_SetPriority(EXTI2_IRQn,2,0);
     HAL_NVIC_EnableIRQ(EXTI2_IRQn);
 }
 
-void EXTI0_IRQHandler(void) {
-    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_0);
-    int a = HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_0);
-    int b = HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_1);
+void EXTI3_IRQHandler(void) {
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_3);
+    int a = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_3);
+    int b = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4);
     spinner_delta += (a != b) ? 1 : -1;
 }
 void EXTI2_IRQHandler(void) {
@@ -1040,10 +1196,11 @@ static void timers_init(void) {
     g.Alternate=GPIO_AF1_TIM2; g.Speed=GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(GPIOA,&g);
 
-    /* TIM2: APB1 clock = 84 MHz.  Prescaler=83 → 1 MHz tick.
+    /* TIM2: APB1 timer clock = 90 MHz (HCLK=180 MHz, APB1 div=4, ×2).
+       Prescaler=89 → 1 MHz tick.
        ARR = 1 000 000 / rate_hz − 1                           */
     htim2.Instance = TIM2;
-    htim2.Init.Prescaler = 83;
+    htim2.Init.Prescaler = 89;
     htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
     htim2.Init.Period = 1000000u / 10000u - 1u; /* default 10 kHz */
     htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -1054,9 +1211,10 @@ static void timers_init(void) {
     oc.OCPolarity=TIM_OCPOLARITY_HIGH; oc.OCFastMode=TIM_OCFAST_DISABLE;
     HAL_TIM_PWM_ConfigChannel(&htim2,&oc,TIM_CHANNEL_1);
 
-    /* TIM4: ramp tick — fires every (ramp_time_s*1000/steps) ms  */
+    /* TIM4: ramp tick — fires every (ramp_time_s*1000/steps) ms
+       APB1 timer clock = 90 MHz; Prescaler=8999 → 10 kHz base */
     htim4.Instance=TIM4;
-    htim4.Init.Prescaler=8399; /* 84MHz/8400 = 10kHz */
+    htim4.Init.Prescaler=8999; /* 90MHz/9000 = 10kHz */
     htim4.Init.CounterMode=TIM_COUNTERMODE_UP;
     htim4.Init.Period=9999u; /* 1 s tick by default */
     htim4.Init.ClockDivision=TIM_CLOCKDIVISION_DIV1;
@@ -1781,6 +1939,7 @@ static void temp_comp_tick(void) {
  * ============================================================ */
 void pulser_run(void) {
     /* --- Hardware init --- */
+    sdram_fmc_init(); /* must be first: framebuffer lives in SDRAM */
     ltdc_init();
     spi2_init();
     dac_init();
